@@ -1,0 +1,127 @@
+[
+  {
+    "capture": "MacBook_Pro_M4_Max_macOS_26_onBattery",
+    "AppleSmartBattery": {
+      "BatteryInstalled": 1,
+      "Temperature": 3049,
+      "VirtualTemperature": 3169,
+      "ExternalConnected": 0,
+      "IsCharging": 0,
+      "Voltage": 12076,
+      "AppleRawBatteryVoltage": 12076,
+      "InstantAmperage": -2335,
+      "Amperage": -2335,
+      "AppleRawCurrentCapacity": 4624,
+      "BatteryData": {}
+    },
+    "expected_temperature_c": 30.49
+  },
+  {
+    "capture": "MacBook_Pro_M1_Pro_macOS_15_appleAdapter",
+    "AppleSmartBattery": {
+      "BatteryInstalled": 1,
+      "Temperature": 3115,
+      "VirtualTemperature": 3829,
+      "ExternalConnected": 1,
+      "IsCharging": 1,
+      "Voltage": 12532,
+      "AppleRawBatteryVoltage": 12532,
+      "InstantAmperage": 5114,
+      "Amperage": 5114,
+      "AppleRawCurrentCapacity": 3386,
+      "BatteryData": {}
+    },
+    "expected_temperature_c": 31.15
+  },
+  {
+    "capture": "MacBook_Air_M4_macOS_26_appleAdapter",
+    "AppleSmartBattery": {
+      "BatteryInstalled": 1,
+      "Temperature": 2999,
+      "VirtualTemperature": 2679,
+      "ExternalConnected": 1,
+      "IsCharging": 0,
+      "Voltage": 12386,
+      "AppleRawBatteryVoltage": 12386,
+      "InstantAmperage": 0,
+      "Amperage": 0,
+      "AppleRawCurrentCapacity": 3244,
+      "BatteryData": {}
+    },
+    "expected_temperature_c": 29.99
+  },
+  {
+    "capture": "MacBook_Pro_M5_macOS_26_appleAdapter",
+    "AppleSmartBattery": {
+      "BatteryInstalled": 1,
+      "Temperature": 3103,
+      "VirtualTemperature": 3709,
+      "ExternalConnected": 1,
+      "IsCharging": 0,
+      "Voltage": 12296,
+      "AppleRawBatteryVoltage": 12296,
+      "InstantAmperage": 0,
+      "Amperage": 0,
+      "AppleRawCurrentCapacity": 4732,
+      "BatteryData": {}
+    },
+    "expected_temperature_c": 31.03
+  },
+  {
+    "capture": "MacBook_Air_M2_macOS_27_appleAdapter",
+    "AppleSmartBattery": {
+      "BatteryInstalled": 1,
+      "ExternalConnected": 1,
+      "IsCharging": 1,
+      "Voltage": 11842,
+      "AppleRawBatteryVoltage": 11842,
+      "InstantAmperage": 2019,
+      "Amperage": 2019,
+      "BatteryData": {
+        "BatteryPower": 23908,
+        "RemainingCapacity": 1461
+      }
+    },
+    "expected_temperature_c": 33.59,
+    "AppleSmartBatteryPack": {
+      "BatteryData": {
+        "Temperature": 3359,
+        "VirtualTemperature": 3359
+      }
+    }
+  },
+  {
+    "capture": "MacBook_Air_M3_macOS_27_unknownAdapter",
+    "AppleSmartBattery": {
+      "BatteryInstalled": 1,
+      "ExternalConnected": 1,
+      "IsCharging": 0,
+      "Voltage": 12507,
+      "AppleRawBatteryVoltage": 12507,
+      "InstantAmperage": 0,
+      "Amperage": 0,
+      "BatteryData": {
+        "BatteryPower": 0,
+        "RemainingCapacity": 3334
+      }
+    },
+    "expected_temperature_c": 29.89,
+    "AppleSmartBatteryPack": {
+      "BatteryData": {
+        "Temperature": 2989,
+        "VirtualTemperature": 2989
+      }
+    }
+  },
+  {
+    "capture": "Mac_mini_M4_macOS_26_noBattery",
+    "AppleSmartBattery": {
+      "BatteryInstalled": 0,
+      "ExternalConnected": 1,
+      "IsCharging": 0,
+      "Voltage": 0,
+      "Amperage": 0
+    },
+    "expected_temperature_c": null
+  }
+]

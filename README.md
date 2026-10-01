@@ -2,7 +2,7 @@
 
 A local battery telemetry producer for [RunCat Neo](https://github.com/runcat-dev/RunCatNeo) custom metrics on macOS.
 
-It reads `AppleSmartBattery` telemetry with `ioreg`, writes a RunCat-compatible JSON snapshot, and keeps the producer lightweight with adaptive polling.
+It reads `AppleSmartBattery` telemetry with `ioreg` (plus `AppleSmartBatteryPack` only when needed for temperature), writes a RunCat-compatible JSON snapshot, and keeps the producer lightweight with adaptive polling.
 
 ## What it shows
 
@@ -13,6 +13,29 @@ It reads `AppleSmartBattery` telemetry with `ioreg`, writes a RunCat-compatible 
 - **Temperature** — battery temperature
 
 While connected to external power, runtime is shown as `On AC`; while charging, it is shown as `Charging`.
+
+## Temperature sources
+
+The producer reads top-level `AppleSmartBattery.Temperature / 100.0`. When that
+value is missing or invalid, it queries `AppleSmartBatteryPack` once and reads
+exactly `BatteryData.Temperature / 100.0` from its plist output. This covers the
+macOS 26 and 27 layouts without an OS-version probe or unit guessing.
+
+`VirtualTemperature` is a distinct reading whose exact sensor/model semantics
+are not established by the public evidence; it is retained in diagnostics but
+does not override or substitute for `Temperature`. For example, the public
+measurements include `Temperature=3049`, `VirtualTemperature=3169`, and another
+capture has `3115` versus `3829`. The displayed temperatures are **30.49 °C** and
+**31.15 °C**, respectively, following SystemInfoKit's conversion.
+
+An explicitly absent battery skips the pack lookup. A missing service, timeout,
+malformed/ambiguous plist, or invalid temperature displays `—` without dropping
+the power sample or changing the 5/60-second polling decision. Each `ioreg` call
+has a two-second timeout; no retry loop or persistent failure cache is added.
+The existing zero/65535 sentinel exclusion and −20 to 100 °C validity range remain.
+
+The pinned upstream implementation, measured-value provenance, and offline test
+cases are documented in [tests/fixtures/README.md](tests/fixtures/README.md).
 
 ## Runtime confidence
 
@@ -136,6 +159,17 @@ After uninstalling, remove the Custom Metrics source from RunCat Neo if it is st
 ## Privacy
 
 The producer is local-only. It reads battery telemetry from `ioreg` and writes local JSON files. It makes no network requests.
+
+Raw battery/pack dumps are never written to the snapshot or history. Diagnostics
+print selected numeric/state fields and the temperature source, not device serials.
+
+## Tests
+
+Run the fixture and subprocess-mock regression tests without macOS hardware or network access:
+
+```bash
+python3 -B -m unittest discover -s tests -v
+```
 
 ## License
 

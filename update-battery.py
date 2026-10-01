@@ -18,9 +18,11 @@ Observed AppleSmartBattery conventions vary across hardware/macOS:
 
 - InstantAmperage/Amperage can likewise be signed values printed unsigned.
 
-- VirtualTemperature is centi-degrees Celsius.
+- Temperature is centi-degrees Celsius on the measured macOS 15/26/27 devices.
 
-- A top-level Temperature reading is traditionally deci-Kelvin on macOS.
+- macOS 27 exposes it in AppleSmartBatteryPack.BatteryData instead.
+
+- VirtualTemperature is a distinct, undocumented reading, not a substitute.
 
 
 
@@ -42,6 +44,8 @@ import math
 
 import os
 
+import plistlib
+
 import re
 
 import subprocess
@@ -55,6 +59,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from typing import Any
+
+from xml.parsers.expat import ExpatError
 
 
 
@@ -111,11 +117,16 @@ BOOL_RE_TEMPLATE = r'"{key}"\s*=\s*(Yes|No|true|false|0|1)'
 
 
 
-def run_ioreg() -> str:
+def run_ioreg(service: str = "AppleSmartBattery", *, archive: bool = False) -> str:
+
+    # Depth 1 excludes child services; unlimited width avoids truncated values.
+    command = [IOREG, "-rn", service, "-l", "-d", "1", "-w", "0"]
+    if archive:
+        command.append("-a")
 
     proc = subprocess.run(
 
-        [IOREG, "-rn", "AppleSmartBattery", "-l"],
+        command,
 
         capture_output=True,
 
@@ -133,7 +144,7 @@ def run_ioreg() -> str:
 
         detail = proc.stderr.strip() or f"exit status {proc.returncode}"
 
-        raise RuntimeError(f"Unable to read AppleSmartBattery: {detail}")
+        raise RuntimeError(f"Unable to read {service}: {detail}")
 
     return proc.stdout
 
@@ -283,48 +294,56 @@ def plausible_celsius(value: float | None) -> float | None:
 
 
 
+def top_level_number(text: str, key: str) -> int | None:
+    # ioreg's text format prints nested dictionaries inline. Match a complete
+    # property line, never a same-named key inside BatteryData/AdapterDetails.
+    match = re.search(
+        rf'^[ \t|]*"{re.escape(key)}"[ \t]*=[ \t]*(-?\d+)[ \t]*$',
+        text,
+        re.MULTILINE,
+    )
+    return int(match.group(1)) if match else None
+
+
+def centi_celsius(raw: Any) -> float | None:
+    # Preserve the existing zero/65535 sentinel policy. Check bounds before
+    # conversion so even a corrupt, oversized integer cannot overflow.
+    if type(raw) not in (int, float) or raw == 0 or not -2000 <= raw <= 10000:
+        return None
+    return plausible_celsius(raw / 100.0)
+
+
 def battery_temperature_c(text: str) -> tuple[float | None, str]:
-
-    """Return battery temperature in Celsius.
-
-
-
-    Prefer VirtualTemperature because AppleSmartBattery publishes it in
-
-    centi-degrees Celsius. If unavailable, interpret Temperature using the
-
-    traditional macOS SmartBattery deci-Kelvin convention.
-
-    """
+    """Parse AppleSmartBattery.Temperature in centi-Celsius, without I/O."""
+    if raw_bool(text, "BatteryInstalled") is False:
+        return None, "Unavailable"
+    value = centi_celsius(top_level_number(text, "Temperature"))
+    return (value, "Temperature") if value is not None else (None, "Unavailable")
 
 
+def read_battery_temperature_c(text: str) -> tuple[float | None, str]:
+    """Query the pack only when the primary temperature is unavailable."""
+    temperature = battery_temperature_c(text)
+    if temperature[0] is not None or raw_bool(text, "BatteryInstalled") is False:
+        return temperature
 
-    virtual_raw = raw_number(text, "VirtualTemperature")
+    try:
+        pack_text = run_ioreg("AppleSmartBatteryPack", archive=True)
+        packs = plistlib.loads(pack_text.encode("utf-8"))
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, ExpatError):
+        # An optional temperature lookup must not lose the power sample or
+        # change its adaptive interval. Never print or persist the raw dump.
+        return None, "Unavailable"
 
-    if virtual_raw is not None and virtual_raw not in (0, 65535):
-
-        value = plausible_celsius(virtual_raw / 100.0)
-
-        if value is not None:
-
-            return value, "VirtualTemperature"
-
-
-
-    temperature_raw = raw_number(text, "Temperature")
-
-    if temperature_raw is not None and temperature_raw not in (0, 65535):
-
-        deci_kelvin_c = (temperature_raw / 10.0) - 273.15
-
-        value = plausible_celsius(deci_kelvin_c)
-
-        if value is not None:
-
-            return value, "Temperature"
-
-
-
+    # Do not guess which pack to use if the service layout is ambiguous.
+    if not isinstance(packs, list) or len(packs) != 1 or not isinstance(packs[0], dict):
+        return None, "Unavailable"
+    battery_data = packs[0].get("BatteryData")
+    if not isinstance(battery_data, dict):
+        return None, "Unavailable"
+    value = centi_celsius(battery_data.get("Temperature"))
+    if value is not None:
+        return value, "AppleSmartBatteryPack.BatteryData.Temperature"
     return None, "Unavailable"
 
 
@@ -885,7 +904,7 @@ def diagnostic(text: str) -> dict[str, Any]:
 
     power, power_source = battery_power_w(text)
 
-    temperature, temperature_source = battery_temperature_c(text)
+    temperature, temperature_source = read_battery_temperature_c(text)
 
     remaining_energy, remaining_energy_source = battery_remaining_energy_wh(text)
 
@@ -923,9 +942,9 @@ def diagnostic(text: str) -> dict[str, Any]:
 
         "StateOfChargeRaw": raw_number(text, "StateOfCharge"),
 
-        "TemperatureRaw": raw_number(text, "Temperature"),
+        "TemperatureRaw": top_level_number(text, "Temperature"),
 
-        "VirtualTemperatureRaw": raw_number(text, "VirtualTemperature"),
+        "VirtualTemperatureRaw": top_level_number(text, "VirtualTemperature"),
 
         "ExternalConnected": raw_bool(text, "ExternalConnected"),
 
@@ -971,7 +990,7 @@ def sample_once() -> str:
 
     power, _power_source = battery_power_w(text)
 
-    temperature, _temperature_source = battery_temperature_c(text)
+    temperature, _temperature_source = read_battery_temperature_c(text)
 
     state = battery_state(text)
 
