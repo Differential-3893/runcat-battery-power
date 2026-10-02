@@ -37,6 +37,10 @@ from __future__ import annotations
 
 
 import argparse
+import fcntl
+import stat
+import sys
+from contextlib import contextmanager
 
 import json
 
@@ -106,6 +110,8 @@ AC_POLL_INTERVAL_SECONDS = 60
 RUNTIME_WARMUP_SECONDS = 60
 RUNTIME_STABLE_SECONDS = 240
 RUNTIME_MIN_SAMPLES = 6
+MAX_HISTORY_BYTES = 2_000_000
+ACTIVE_STATES = ("charging", "discharging")
 
 
 
@@ -142,9 +148,7 @@ def run_ioreg(service: str = "AppleSmartBattery", *, archive: bool = False) -> s
 
     if proc.returncode != 0 or not proc.stdout.strip():
 
-        detail = proc.stderr.strip() or f"exit status {proc.returncode}"
-
-        raise RuntimeError(f"Unable to read {service}: {detail}")
+        raise RuntimeError(f"Unable to read {service} telemetry")
 
     return proc.stdout
 
@@ -152,42 +156,81 @@ def run_ioreg(service: str = "AppleSmartBattery", *, archive: bool = False) -> s
 
 
 
+def property_literal(text: str, key: str) -> str | None:
+    """Read one whole top-level ioreg property, not a nested lookalike."""
+    values = re.findall(rf'^[ \t|]*"{re.escape(key)}"[ \t]*=[ \t]*([^\n]*)$',
+                        text, re.MULTILINE)
+    return values[0].strip() if len(values) == 1 else None
+
+
+def dictionary_literal(text: str, key: str) -> str | None:
+    """Find a direct key in an inline ioreg dictionary; skip nested values.
+
+    ioreg dictionaries are not JSON. Split only outside quoted strings and
+    balanced collections instead of guessing units or matching every subtree.
+    """
+    if not text.startswith("{") or not text.endswith("}"):
+        return None
+    parts, start, depth, quoted, escaped = [], 1, 0, False, False
+    for i in range(1, len(text) - 1):
+        char = text[i]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "{([":
+            depth += 1
+        elif char in "})]":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif char == "," and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    if depth or quoted:
+        return None
+    parts.append(text[start:-1])
+    values = []
+    for part in parts:
+        match = re.fullmatch(rf'\s*"{re.escape(key)}"\s*=\s*(.*?)\s*', part)
+        if match:
+            values.append(match.group(1))
+    return values[0] if len(values) == 1 else None
+
+
+def integer_literal(value: str | None) -> int | None:
+    # All numeric telemetry consumed here fits in a signed/unsigned 64-bit
+    # ioreg integer. Bound before int() to tolerate corrupt oversized fields.
+    if value is None or not re.fullmatch(r'-?\d{1,20}', value):
+        return None
+    number = int(value)
+    return number if -(1 << 63) <= number < (1 << 64) else None
+
+
 def raw_number(text: str, key: str) -> int | None:
-
-    pattern = NUMBER_RE_TEMPLATE.format(key=re.escape(key))
-
-    match = re.search(pattern, text)
-
-    if not match:
-
-        return None
-
-    try:
-
-        return int(match.group(1))
-
-    except ValueError:
-
-        return None
-
-
-
+    value = property_literal(text, key)
+    if value is not None:
+        return integer_literal(value)
+    # Preserve BatteryData fallbacks without accidentally reading adapter or
+    # lifetime statistics. Temperature deliberately has its own source policy.
+    nested = property_literal(text, "BatteryData")
+    return integer_literal(dictionary_literal(nested, key)) if nested else None
 
 
 def raw_bool(text: str, key: str) -> bool | None:
-
-    pattern = BOOL_RE_TEMPLATE.format(key=re.escape(key))
-
-    match = re.search(pattern, text, re.IGNORECASE)
-
-    if not match:
-
+    value = property_literal(text, key)
+    if value is None:
         return None
-
-    return match.group(1).lower() in {"yes", "true", "1"}
-
-
-
+    if value.lower() in ("yes", "true", "1"):
+        return True
+    if value.lower() in ("no", "false", "0"):
+        return False
+    return None
 
 
 def signed_64(value: int | None) -> int | None:
@@ -256,13 +299,13 @@ def battery_power_w(text: str) -> tuple[float | None, str]:
 
     current_ma = signed_64(raw_number(text, "InstantAmperage"))
 
-    if current_ma in (None, 0):
+    if current_ma is None:
 
         current_ma = signed_64(raw_number(text, "Amperage"))
 
 
 
-    if voltage_mv and voltage_mv > 0 and current_ma not in (None, 0):
+    if voltage_mv and voltage_mv > 0 and current_ma is not None:
 
         power = sane_power_magnitude_w((voltage_mv * current_ma) / 1_000_000.0)
 
@@ -295,14 +338,7 @@ def plausible_celsius(value: float | None) -> float | None:
 
 
 def top_level_number(text: str, key: str) -> int | None:
-    # ioreg's text format prints nested dictionaries inline. Match a complete
-    # property line, never a same-named key inside BatteryData/AdapterDetails.
-    match = re.search(
-        rf'^[ \t|]*"{re.escape(key)}"[ \t]*=[ \t]*(-?\d+)[ \t]*$',
-        text,
-        re.MULTILINE,
-    )
-    return int(match.group(1)) if match else None
+    return integer_literal(property_literal(text, key))
 
 
 def centi_celsius(raw: Any) -> float | None:
@@ -473,7 +509,7 @@ def estimated_runtime_hours(
 
     if state != "discharging":
         return None
-    if remaining_energy_wh is None or average_w is None:
+    if not finite_number(remaining_energy_wh) or not finite_number(average_w):
         return None
     if not math.isfinite(average_w) or average_w < 0.5:
         return None
@@ -494,7 +530,7 @@ def atomic_write_json(path: Path, value: Any) -> None:
 
         with os.fdopen(fd, "w", encoding="utf-8") as f:
 
-            json.dump(value, f, ensure_ascii=False)
+            json.dump(value, f, ensure_ascii=False, allow_nan=False)
 
         os.replace(temp_path, path)
 
@@ -514,223 +550,113 @@ def atomic_write_json(path: Path, value: Any) -> None:
 
 
 
-def load_history() -> list[dict[str, Any]]:
-
+def finite_number(value: Any) -> bool:
+    if type(value) not in (int, float):
+        return False
     try:
+        return math.isfinite(value)
+    except (OverflowError, ValueError):
+        return False
 
-        data = json.loads(HISTORY.read_text(encoding="utf-8"))
 
-    except (OSError, json.JSONDecodeError):
-
+def load_history() -> list[dict[str, Any]]:
+    try:
+        with HISTORY.open("rb") as stream:
+            raw = stream.read(MAX_HISTORY_BYTES + 1)
+        if len(raw) > MAX_HISTORY_BYTES:
+            return []
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
         return []
+    return data if isinstance(data, list) else []
 
-    if not isinstance(data, list):
 
+def max_sample_gap(state: str) -> int:
+    # Tolerate ordinary scheduling jitter; a gap longer than three scheduled
+    # intervals is not evidence of continuous observation (e.g. after sleep).
+    return 3 * poll_interval_seconds(state)
+
+
+def continuous_history(history: list, now: float, state: str) -> list[dict[str, Any]]:
+    if state not in ACTIVE_STATES or not finite_number(now):
         return []
-
-    return [item for item in data if isinstance(item, dict)]
-
-
-
-
-
-def update_history(
-
-    now: float,
-
-    power_w: float | None,
-
-    state: str,
-
-) -> list[dict[str, Any]]:
-
-    history = load_history()
-
-
-
-    retained = []
-
+    retained: list[dict[str, Any]] = []
     cutoff = now - HISTORY_RETENTION_SECONDS
-
     for item in history:
-
-        timestamp = item.get("timestamp")
-
-        power = item.get("powerW")
-
-        mode = item.get("state")
-
-        if (
-
-            isinstance(timestamp, (int, float))
-
-            and timestamp >= cutoff
-
-            and isinstance(power, (int, float))
-
-            and mode in {"charging", "discharging"}
-
-        ):
-
-            retained.append(
-
-                {
-
-                    "timestamp": float(timestamp),
-
-                    "powerW": float(power),
-
-                    "state": mode,
-
-                }
-
-            )
-
-
-
-    # A rolling average must belong to one continuous power-state session.
-    # Otherwise a brief AC/charging interval could mix an older discharge run
-    # into a newly started one.  Reset as soon as a state transition is seen.
-    if retained and retained[-1].get("state") != state:
-
-        retained = []
-
-
-
-    if power_w is not None and state in {"charging", "discharging"}:
-
-        retained.append(
-
-            {
-
-                "timestamp": now,
-
-                "powerW": round(float(power_w), 4),
-
-                "state": state,
-
-            }
-
-        )
-
-
-
-    atomic_write_json(HISTORY, retained)
-
+        if not isinstance(item, dict):
+            retained = []
+            continue
+        timestamp, power = item.get("timestamp"), item.get("powerW")
+        if (not finite_number(timestamp) or not finite_number(power)
+                or not 0 <= power < 200 or item.get("state") != state
+                or timestamp > now):
+            retained = []
+            continue
+        if timestamp < cutoff:
+            continue
+        if retained:
+            delta = timestamp - retained[-1]["timestamp"]
+            if delta < 0 or delta > max_sample_gap(state):
+                retained = []
+            elif delta == 0:
+                retained.pop()  # One timestamp is one sample, not confidence.
+        retained.append({"timestamp": float(timestamp), "powerW": float(power), "state": state})
+    if retained and now - retained[-1]["timestamp"] > max_sample_gap(state):
+        return []
     return retained
 
 
-
-def five_minute_stats(
-
-    history: list[dict[str, Any]],
-
-    now: float,
-
-    state: str,
-
-) -> tuple[float | None, float | None, float, int]:
-
-    """Return time-weighted average, peak, covered seconds, and sample count.
-
-    With perfectly regular 5-second polling, the time-weighted average is
-    essentially the ordinary sample mean.  Time weighting is more correct when
-    polling is delayed, the machine is busy, or the script is run manually.
-    """
-
-    if state not in {"charging", "discharging"}:
-
-        return None, None, 0.0, 0
-
-
-
-    cutoff = now - HISTORY_WINDOW_SECONDS
-
-    relevant: list[tuple[float, float]] = []
-
-    for item in history:
-
-        timestamp = item.get("timestamp")
-
-        power = item.get("powerW")
-
-        if (
-
-            item.get("state") == state
-
-            and isinstance(timestamp, (int, float))
-
-            and float(timestamp) >= cutoff
-
-            and isinstance(power, (int, float))
-
-        ):
-
-            relevant.append((float(timestamp), float(power)))
-
-
-
-    if not relevant:
-
-        return None, None, 0.0, 0
-
-
-
-    relevant.sort(key=lambda item: item[0])
-
-    first_timestamp = relevant[0][0]
-
-    coverage_seconds = max(0.0, min(HISTORY_WINDOW_SECONDS, now - first_timestamp))
-
-    sample_count = len(relevant)
-
-    peak = max(power for _timestamp, power in relevant)
-
-
-
-    if sample_count == 1 or coverage_seconds <= 0.0:
-
-        return relevant[-1][1], peak, coverage_seconds, sample_count
-
-
-
-    # Trapezoidal integration over the observed samples, then hold the newest
-    # sample constant from its timestamp to `now`.
-    area_watt_seconds = 0.0
-
-    for (t0, p0), (t1, p1) in zip(relevant, relevant[1:]):
-
-        dt = max(0.0, t1 - t0)
-
-        area_watt_seconds += 0.5 * (p0 + p1) * dt
-
-
-
-    last_timestamp, last_power = relevant[-1]
-
-    area_watt_seconds += last_power * max(0.0, now - last_timestamp)
-
-
-
-    observed_seconds = max(0.0, now - first_timestamp)
-
-    if observed_seconds <= 0.0:
-
-        average = sum(power for _timestamp, power in relevant) / sample_count
-
+def update_history(now: float, power_w: float | None, state: str) -> list[dict[str, Any]]:
+    retained = continuous_history(load_history(), now, state)
+    if (finite_number(now) and finite_number(power_w) and 0 <= power_w < 200
+            and state in ACTIVE_STATES):
+        if retained and retained[-1]["timestamp"] == now:
+            retained.pop()
+        retained.append({"timestamp": float(now), "powerW": round(float(power_w), 4), "state": state})
     else:
+        # An unavailable reading must not turn an old observation into a fresh
+        # average/runtime. Keep the normal snapshot with unavailable fields.
+        retained = []
+    atomic_write_json(HISTORY, retained)
+    return retained
 
-        average = area_watt_seconds / observed_seconds
 
+def five_minute_stats(history: list[dict[str, Any]], now: float, state: str
+                      ) -> tuple[float | None, float | None, float, int]:
+    """Integrate the continuous session, clipped to the last 300 seconds.
 
-
-    return average, peak, coverage_seconds, sample_count
-
+    Use the sample immediately before the boundary for interpolation, but do
+    not count the interpolated boundary as another real observation.
+    """
+    valid = continuous_history(history, now, state)
+    if not valid:
+        return None, None, 0.0, 0
+    points = [(item["timestamp"], item["powerW"]) for item in valid]
+    cutoff = now - HISTORY_WINDOW_SECONDS
+    count = sum(t >= cutoff for t, _ in points)
+    i = 0
+    while i + 1 < len(points) and points[i + 1][0] <= cutoff:
+        i += 1
+    points = points[i:]
+    if points[0][0] < cutoff:
+        t0, p0 = points[0]
+        if len(points) > 1:
+            t1, p1 = points[1]
+            p0 += (p1 - p0) * (cutoff - t0) / (t1 - t0)
+        points[0] = (cutoff, p0)
+    coverage = max(0.0, now - points[0][0])
+    peak = max(power for _, power in points)
+    if coverage <= 0:
+        return points[-1][1], peak, 0.0, count
+    area = sum(0.5 * (p0 + p1) * (t1 - t0)
+               for (t0, p0), (t1, p1) in zip(points, points[1:]))
+    area += points[-1][1] * (now - points[-1][0])
+    return area / coverage, peak, coverage, count
 
 
 def format_watts(value: float | None) -> str:
 
-    return "—" if value is None else f"{value:.1f} W"
+    return "—" if not finite_number(value) else f"{value:.1f} W"
 
 
 
@@ -738,7 +664,7 @@ def format_watts(value: float | None) -> str:
 
 def format_temp(value: float | None) -> str:
 
-    return "—" if value is None else f"{value:.1f} °C"
+    return "—" if not finite_number(value) else f"{value:.1f} °C"
 
 
 
@@ -767,7 +693,7 @@ def format_runtime(
     ):
         return "Calculating…"
 
-    if value is None:
+    if not finite_number(value) or value <= 0:
         return "—"
 
     total_minutes = max(1, int(round(value * 60.0)))
@@ -984,7 +910,7 @@ def poll_interval_seconds(state: str) -> int:
 
 
 
-def sample_once() -> str:
+def _sample_once_unlocked() -> str:
 
     text = run_ioreg()
 
@@ -1038,6 +964,38 @@ def sample_once() -> str:
 
 
 
+
+@contextmanager
+def sample_lock(path: Path | None = None, timeout: float = 6.0):
+    history_path = HISTORY if path is None else path
+    lock_path = history_path.with_name("." + history_path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError("Sampling lock is not a regular file")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Another battery sample is still running")
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)  # Releases the advisory lock, including on exceptions.
+
+
+def sample_once() -> str:
+    if OUT.expanduser().resolve() == HISTORY.expanduser().resolve():
+        raise ValueError("Snapshot and history paths must differ")
+    with sample_lock():
+        return _sample_once_unlocked()
+
+
 def main() -> None:
 
     parser = argparse.ArgumentParser()
@@ -1088,4 +1046,9 @@ def main() -> None:
 
 if __name__ == "__main__":
 
-    main()
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        # No raw ioreg stderr, plist, device serials or traceback in launchd logs.
+        print("Battery sample failed. Check --diagnose; raw telemetry is not logged.", file=sys.stderr)
+        raise SystemExit(1)

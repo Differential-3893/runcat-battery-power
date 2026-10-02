@@ -185,7 +185,7 @@ class TemperatureTests(unittest.TestCase):
                     self.assertEqual(rows[-1]["state"], state)
                     self.assertAlmostEqual(rows[-1]["powerW"], expected_power, places=4)
                 self.assertNotIn("PRIVATE_SENTINEL", out.read_text() + history.read_text())
-                self.assertEqual({p.name for p in Path(folder).iterdir()}, {"snapshot.json", "history.json"})
+                self.assertEqual({p.name for p in Path(folder).iterdir()}, {"snapshot.json", "history.json", ".history.json.lock"})
 
     def test_fallback_failure_keeps_power_sample_and_poll_interval(self):
         failures = [response("", 1, "PRIVATE_SENTINEL"), response(""),

@@ -45,7 +45,12 @@ The runtime estimate is deliberately conservative about fresh data:
 - 60 seconds to about 4 minutes: approximate value such as `~6h 32m`
 - after about 4 minutes: value such as `6h 21m`
 
-Switching between battery and external power resets the rolling history so an old discharge session does not contaminate a new one.
+Switching power state resets the rolling history so an old session does not
+contaminate a new one. A missing/invalid power observation or a gap longer than
+three scheduled intervals also restarts confidence (15 seconds while discharging,
+180 seconds while charging). This is a sampling-continuity policy, not a claim
+that the script can detect every sleep/wake event. `Calculating…` after a long
+pause is intentional, rather than reporting an old estimate as settled.
 
 ## How the estimate works
 
@@ -61,7 +66,13 @@ and then computes
 estimated runtime (h) = remaining energy (Wh) / 5-minute average power (W)
 ```
 
-The five-minute average is time-weighted using trapezoidal integration rather than a plain sample mean, so delayed polls do not receive the same weight as regularly spaced samples.
+The five-minute average uses trapezoidal integration of a continuous session,
+clipped to the recent 300-second window. The observation just before the window
+is used to interpolate its boundary, without counting that synthetic point as
+another sample. Small polling delays are tolerated; long gaps are not integrated
+as though the workload had been observed. A valid zero-current observation is
+0 W, not missing telemetry. Numeric reads are scoped to top-level properties or
+direct `BatteryData` fields, not adapter/lifetime dictionaries with similar keys.
 
 This is a **workload-dependent estimate**, not a promise of actual battery life. Display brightness, CPU/GPU activity, radios, peripherals, background work, temperature, and future workload changes can move the estimate substantially. Multiplying remaining charge by the current pack voltage is also an approximation because pack voltage changes during discharge.
 
@@ -94,10 +105,29 @@ chmod +x install.sh uninstall.sh
 
 The installer:
 
-1. copies the producer to `~/.runcat/runcat-battery-power/`
-2. writes an initial `~/.runcat/battery-power.json`
-3. installs `~/Library/LaunchAgents/dev.runcat.battery-power.plist`
-4. starts the adaptive background sampler
+1. tests a live sample in a temporary directory before replacing existing files,
+2. stops the old battery LaunchAgent and backs up its target files under
+   `~/.runcat/backups/battery-power-.../`,
+3. atomically installs the producer and `dev.runcat.battery-power.plist`,
+4. starts the same adaptive sampler and verifies a live sample and running job,
+5. restores previous target files and launch state on detected installation failure.
+
+Success ends with `LOCAL CHECK PASSED`. This checks actual telemetry, installed
+source, configuration and a running job; it does not automate observation of the
+RunCat UI or a full battery/AC polling cycle. No `sudo` is required.
+
+Existing source registration does not need to be re-added. Custom absolute paths
+(`RUNCAT_HOME`, `RUNCAT_OUT_FILE`, `RUNCAT_BATTERY_HISTORY_FILE`, and
+`RUNCAT_BATTERY_INSTALL_DIR`) are passed to both the initial sample and LaunchAgent.
+A later reinstall without these variables reuses paths from the existing plist.
+`PYTHON_BIN` can select a Python 3.10+ interpreter. A previously unrecorded custom
+history path cannot be recovered automatically; supply it once when upgrading.
+
+From this repository, repeat the live verification with:
+
+```bash
+python3 -B scripts/manage_install.py verify
+```
 
 Then open **RunCat Neo → Settings → Metrics → Custom Metrics → Add Custom Metrics Source** and select:
 
@@ -140,7 +170,11 @@ Background logs, normally empty, are stored at:
 ~/.runcat/battery-power-history.json
 ```
 
-The JSON snapshot is written atomically so RunCat does not observe a partially written file.
+The JSON snapshot is written atomically so RunCat does not observe a partially
+written file. A shared empty `.battery-power-history.json.lock` file serializes
+manual and background samples. The file is not telemetry and should not be
+removed while sampling. Invalid/nonfinite history is discarded conservatively;
+JSON writes reject NaN and Infinity.
 
 ## Uninstall
 
@@ -154,7 +188,10 @@ To remove the LaunchAgent and installed scripts but keep the generated JSON/hist
 ./uninstall.sh --keep-data
 ```
 
-After uninstalling, remove the Custom Metrics source from RunCat Neo if it is still registered there.
+After uninstalling, remove the Custom Metrics source from RunCat Neo if it is
+still registered there. Target files are backed up before removal. Backups,
+logs, the empty lock file, and unrelated files are retained; the installer never
+recursively removes a shared directory.
 
 ## Privacy
 
@@ -170,6 +207,11 @@ Run the fixture and subprocess-mock regression tests without macOS hardware or n
 ```bash
 python3 -B -m unittest discover -s tests -v
 ```
+
+The regression suite includes synthetic telemetry, real interprocess lock and
+shell-loop tests, and installation/rollback tests with mocked launchctl and
+synthetic battery readings. Passing these is not native hardware certification.
+See [stabilization notes](docs/STABILIZATION_20261003.md) for scope and limitations.
 
 ## License
 

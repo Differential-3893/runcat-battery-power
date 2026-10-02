@@ -21,22 +21,29 @@ if [ ! -f "$SCRIPT" ]; then
   exit 1
 fi
 
-trap 'exit 0' INT TERM HUP
+sleep_pid=""
+cleanup() {
+  if [ -n "$sleep_pid" ]; then
+    kill "$sleep_pid" 2>/dev/null || true
+    wait "$sleep_pid" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap cleanup INT TERM HUP
 
 while :; do
   if delay=$("$PYTHON_BIN" "$SCRIPT" --adaptive-sample); then
     case "$delay" in
-      ''|*[!0-9]*) delay=60 ;;
+      5|60) ;;
+      *) delay=60 ;;
     esac
   else
     # A temporary telemetry failure should not create a hot retry loop.
     delay=60
   fi
 
-  if [ "$delay" -lt 1 ]; then
-    delay=60
-  fi
-
   sleep "$delay" &
-  wait $!
+  sleep_pid=$!
+  wait "$sleep_pid"
+  sleep_pid=""
 done
