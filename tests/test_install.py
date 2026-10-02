@@ -266,5 +266,18 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], [cfg.python, str(ROOT / "update-battery.py")])
 
 
+    def test_output_cannot_replace_python_log_or_lock(self):
+        cfg = manager.Config()
+        for target in (Path(cfg.python), cfg.install/'stdout.log', cfg.install/'stderr.log',
+                       cfg.history.with_name('.'+cfg.history.name+'.lock')):
+            with self.subTest(path=target), patch.dict(os.environ,{'RUNCAT_OUT_FILE':str(target)}):
+                with self.assertRaises(RuntimeError):manager.Config()
+
+    def test_history_cannot_replace_a_runtime_executable(self):
+        cfg = manager.Config()
+        with patch.dict(os.environ,{'RUNCAT_BATTERY_HISTORY_FILE':str(cfg.python)}):
+            with self.assertRaises(RuntimeError):manager.Config()
+
+
 if __name__ == "__main__":
     unittest.main()

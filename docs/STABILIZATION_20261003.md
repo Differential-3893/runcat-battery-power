@@ -1,5 +1,8 @@
 # Stabilization — 2026-10-03
 
+Historical telemetry/installer patch notes. For the current consolidated delivery,
+see [release audit](RELEASE_AUDIT_20261003.md) and [runtime settings](RUNTIME_SETTINGS.md).
+
 Base: `ec5fff1466a973729d0c7130feccc7e4a753c09e` in
 `Differential-3893/runcat-battery-power`.
 
@@ -84,3 +87,8 @@ No CPU, battery-life or hardware-accuracy benchmark is claimed.
 These corrections close the reproduced failures. A future change should be
 justified by a reproducible defect or an observed schema change, not an arbitrary
 request to refactor a working display or guess another temperature unit.
+
+## Runtime-preservation follow-up
+
+See [reinstallation and runtime settings](RUNTIME_SETTINGS.md) for the subsequent
+entrypoint-level preservation correction and its supported-setting contract.

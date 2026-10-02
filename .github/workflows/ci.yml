@@ -7,14 +7,22 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Run unit tests
+        with:
+          persist-credentials: false
+      - name: Python version
+        run: python3 --version
+      - name: Run regression and release-contract tests
         run: python3 -B -m unittest discover -s tests -v
       - name: Check shell syntax
         run: |
-          # sh parses only the first script argument; check the others separately.
-          sh -n adaptive-poll.sh install.sh uninstall.sh
           sh -n install.sh
           sh -n uninstall.sh
+          sh -n adaptive-poll.sh

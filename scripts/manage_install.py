@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from xml.parsers.expat import ExpatError
 
 ROOT = Path(__file__).resolve().parents[1]
+MIN_PYTHON = (3, 10)
 LABEL = "dev.runcat.battery-power"
 LAUNCHCTL = "/bin/launchctl"
 OWNED_SCRIPTS = ("update-battery.py", "adaptive-poll.sh")
@@ -43,16 +44,16 @@ def absolute_path(value: str) -> Path:
 
 
 class Config:
-    def __init__(self):
+    def __init__(self, bootstrap_python: str | None = None):
         self.plist = Path.home() / "Library/LaunchAgents" / (LABEL + ".plist")
         self.old_plist = read_plist(self.plist)
         old = self.old_plist.get("EnvironmentVariables", {})
         if not isinstance(old, dict):
             raise RuntimeError("Existing LaunchAgent environment is not an object")
         def setting(key, default):
-            value = os.environ.get(key) or old.get(key) or str(default)
-            if not isinstance(value, str):
-                raise RuntimeError("Invalid LaunchAgent path setting: " + key)
+            value = os.environ[key] if key in os.environ else old.get(key, str(default))
+            if not isinstance(value, str) or not value.strip() or "\0" in value:
+                raise RuntimeError("Setting must be a nonempty string: " + key)
             return value
         self.home = absolute_path(setting("RUNCAT_HOME", Path.home() / ".runcat"))
         old_script = old.get("RUNCAT_BATTERY_SCRIPT")
@@ -60,9 +61,7 @@ class Config:
         self.install = absolute_path(setting("RUNCAT_BATTERY_INSTALL_DIR", default_install))
         self.out = absolute_path(setting("RUNCAT_OUT_FILE", self.home / "battery-power.json"))
         self.history = absolute_path(setting("RUNCAT_BATTERY_HISTORY_FILE", self.home / "battery-power-history.json"))
-        selected = os.environ.get("PYTHON_BIN") or old.get("PYTHON_BIN") or sys.executable
-        if not isinstance(selected, str):
-            raise RuntimeError("Invalid Python executable setting")
+        selected = setting("PYTHON_BIN", bootstrap_python or sys.executable)
         found = shutil.which(selected)
         if not found:
             raise RuntimeError("Python executable was not found")
@@ -71,6 +70,11 @@ class Config:
         self.domain = f"gui/{os.getuid()}"
         self.target = self.domain + "/" + LABEL
         paths = self.targets()
+        reserved = (Path(self.python), Path('/usr/sbin/ioreg'), Path('/bin/sh'),
+                    self.install / 'stdout.log', self.install / 'stderr.log',
+                    self.history.with_name('.' + self.history.name + '.lock'))
+        if {p.resolve() for p in paths} & {p.resolve() for p in reserved}:
+            raise RuntimeError("Installation/data paths conflict with an executable, log or sampling lock")
         if len({p.resolve() for p in paths}) != len(paths):
             raise RuntimeError("Installation, snapshot, history and plist paths must be distinct")
         for path in paths:
@@ -109,7 +113,7 @@ class Config:
 def require_native():
     if sys.platform != "darwin":
         raise RuntimeError("Installation/verification requires macOS")
-    if sys.version_info < (3, 10):
+    if sys.version_info < MIN_PYTHON:
         raise RuntimeError("Python 3.10 or newer is required")
     if not os.access("/usr/sbin/ioreg", os.X_OK):
         raise RuntimeError("/usr/sbin/ioreg is unavailable")
@@ -263,6 +267,11 @@ def restore(cfg, saved, was_loaded, was_disabled, module):
 
 
 def install(cfg):
+    # The bootstrap manager may run on a different Python from the saved runtime.
+    checked = subprocess.run([cfg.python, "-c", f"import sys; sys.exit(0 if sys.version_info >= {MIN_PYTHON!r} else 1)"],
+                             capture_output=True, timeout=5)
+    if checked.returncode:
+        raise RuntimeError("The selected runtime requires Python 3.10 or newer; nothing was changed")
     module = producer_module()
     # Test hardware before stopping or replacing a working installation. These
     # temporary files are separate from the user's snapshot and history.
@@ -320,12 +329,13 @@ def uninstall(cfg, keep_data):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("install", "verify", "uninstall"))
+    parser.add_argument("--bootstrap-python", help=argparse.SUPPRESS)
     parser.add_argument("--keep-data", action="store_true")
     args = parser.parse_args()
     if args.keep_data and args.action != "uninstall":
         parser.error("--keep-data is only valid with uninstall")
     require_native()
-    cfg = Config()
+    cfg = Config(bootstrap_python=args.bootstrap_python)
     if args.action == "install":
         install(cfg)
     elif args.action == "verify":

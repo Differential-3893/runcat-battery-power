@@ -99,8 +99,7 @@ Tested on Apple Silicon. Battery telemetry keys can vary across Mac models and m
 Clone the repository and run:
 
 ```bash
-chmod +x install.sh uninstall.sh
-./install.sh
+sh install.sh
 ```
 
 The installer:
@@ -120,7 +119,10 @@ Existing source registration does not need to be re-added. Custom absolute paths
 (`RUNCAT_HOME`, `RUNCAT_OUT_FILE`, `RUNCAT_BATTERY_HISTORY_FILE`, and
 `RUNCAT_BATTERY_INSTALL_DIR`) are passed to both the initial sample and LaunchAgent.
 A later reinstall without these variables reuses paths from the existing plist.
-`PYTHON_BIN` can select a Python 3.10+ interpreter. A previously unrecorded custom
+`PYTHON_BIN` can select a Python 3.10+ interpreter. A plain `sh install.sh`
+also preserves that recorded interpreter; the shell's bootstrap Python does not
+replace it. Empty explicit overrides are rejected. See
+[runtime preservation](docs/RUNTIME_SETTINGS.md) for the precise contract. A previously unrecorded custom
 history path cannot be recovered automatically; supply it once when upgrading.
 
 From this repository, repeat the live verification with:
@@ -141,20 +143,23 @@ RunCat Neo's upstream custom-metrics schema is documented here:
 
 - https://github.com/runcat-dev/RunCatNeo/blob/main/docs/CustomMetricsSchema.md
 
-## Diagnostics
+## Diagnostics and manual refresh
 
-Inspect the battery fields used by the producer:
+From this repository, use the installed LaunchAgent's **saved Python and paths**:
 
-```bash
-python3 ~/.runcat/runcat-battery-power/update-battery.py --diagnose
+```sh
+python3 -B scripts/run_installed.py diagnose
+python3 -B scripts/run_installed.py refresh
+python3 -B scripts/run_installed.py show
 ```
 
-Force one sample and inspect the JSON:
-
-```bash
-python3 ~/.runcat/runcat-battery-power/update-battery.py
-python3 -m json.tool ~/.runcat/battery-power.json
-```
+These commands also work with custom output/history/install directories without
+repeating environment overrides. `diagnose` prints the installed producer's
+selected fields without writing telemetry. `refresh` takes one sample and verifies
+a fresh snapshot. `show` only reads the last snapshot (possibly stale); it does
+not sample. The helpers do not add a background process or change configuration.
+Running `update-battery.py` directly with an arbitrary shell Python bypasses the
+saved runtime, so it is not the recommended installed-system check.
 
 Background logs, normally empty, are stored at:
 
@@ -179,13 +184,13 @@ JSON writes reject NaN and Infinity.
 ## Uninstall
 
 ```bash
-./uninstall.sh
+sh uninstall.sh
 ```
 
 To remove the LaunchAgent and installed scripts but keep the generated JSON/history files:
 
 ```bash
-./uninstall.sh --keep-data
+sh uninstall.sh --keep-data
 ```
 
 After uninstalling, remove the Custom Metrics source from RunCat Neo if it is
@@ -213,6 +218,20 @@ shell-loop tests, and installation/rollback tests with mocked launchctl and
 synthetic battery readings. Passing these is not native hardware certification.
 See [stabilization notes](docs/STABILIZATION_20261003.md) for scope and limitations.
 
+## CI and maintenance
+
+CI runs the offline suite on Linux and macOS using a full-SHA-pinned checkout,
+read-only repository permission, no persisted checkout credentials and a bounded
+job timeout. It logs the hosted runner's Python version; it is not a complete
+version matrix. Native battery accuracy, timer behavior and RunCat rendering
+must still be checked on the installation machine. See the
+[release audit](docs/RELEASE_AUDIT_20261003.md) for the current review and the
+[runtime contract](docs/RUNTIME_SETTINGS.md) for setting precedence.
+
+Keep requirements, manual commands and the runtime contract synchronized with
+installer changes. Future action updates need an upstream SHA/version check;
+no automatic update bot or additional background sampler is introduced.
+
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
