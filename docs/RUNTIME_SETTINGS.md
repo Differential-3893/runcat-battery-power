@@ -75,3 +75,19 @@ an explicit installation override instead. `show` is a saved-file read, not a
 fresh observation. The Python that launches this helper need not be the runtime
 Python; queries are dispatched to the recorded executable. No wrapper is sourced
 or evaluated to recover settings.
+
+
+## Capacity/cycle extension
+
+`RUNCAT_BATTERY_HEALTH_FILE` follows the same explicit-nonempty / recorded /
+fresh-default precedence. It defaults to `~/.runcat/battery-health.json` under
+the selected `RUNCAT_HOME`. Both LaunchAgents use the identical recorded Python
+and environment. The health label is `dev.runcat.battery-health`, with RunAtLoad
+and a 21600-second StartInterval, no KeepAlive. The fast 5/60-second loop remains
+unchanged. See [the complete cache and restoration contract](BATTERY_HEALTH.md).
+
+The snapshot, history, health cache, scripts and two plists must be distinct
+and cannot collide with Python, system tools, logs or sampling/setup locks.
+Uninstall and failure restoration account for both labels. The documented
+`refresh-health` manual command carries the saved health-cache path, not an
+ambient `RUNCAT_BATTERY_HEALTH_FILE` left by another shell session.

@@ -86,7 +86,7 @@ def saved_runtime() -> tuple[list[str], dict[str, str], Path]:
         child_env['RUNCAT_HOME'] = home
         child_env['PYTHON_BIN'] = python
         child_env['RUNCAT_BATTERY_SCRIPT'] = script
-        for key in ('RUNCAT_BATTERY_HISTORY_FILE', 'RUNCAT_BATTERY_INSTALL_DIR'):
+        for key in ('RUNCAT_BATTERY_HISTORY_FILE', 'RUNCAT_BATTERY_INSTALL_DIR', 'RUNCAT_BATTERY_HEALTH_FILE'):
             if key in env:
                 child_env[key] = absolute(env[key])
         out = absolute(env.get('RUNCAT_OUT_FILE', str(Path(home) / 'battery-power.json')))
@@ -113,12 +113,17 @@ def snapshot(path: Path, since: float | None = None) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('refresh', 'show', 'diagnose'))
+    parser.add_argument('action', choices=('refresh', 'show', 'diagnose', 'refresh-health'))
     args = parser.parse_args(argv)
     command, env, out = saved_runtime()
     if args.action == 'show':
         result = snapshot(out)  # Last saved snapshot only; no account/sensor query.
     else:
+        if args.action == 'refresh-health':
+            health = subprocess.run(command + ['--refresh-health', '--force-health'], env=env,
+                                    capture_output=True, text=True, timeout=25)
+            if health.returncode:
+                raise RuntimeError('macOS capacity refresh failed; the last observation is retained with its age. No raw report was logged.')
         if args.action == 'diagnose':
             command = ([command[0], '-B', '-c', CODEX_DIAGNOSTIC, command[1]]
                        if PROJECT == 'codex-runcat-neo' else command + ['--diagnose'])

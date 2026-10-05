@@ -522,6 +522,8 @@ def estimated_runtime_hours(
 
 def atomic_write_json(path: Path, value: Any) -> None:
 
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise RuntimeError("Output is not a regular file")
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}-", dir=str(path.parent))
@@ -709,6 +711,235 @@ def format_runtime(
 
 
 
+# Slow macOS capacity observation: never invoked from the fast sampler.
+SYSTEM_PROFILER = "/usr/sbin/system_profiler"
+HEALTH_INTERVAL_SECONDS = 6 * 60 * 60
+HEALTH_STARTUP_COOLDOWN_SECONDS = 300
+HEALTH_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+MAX_HEALTH_BYTES = 16 * 1024
+MAX_PROFILER_BYTES = 512 * 1024
+HEALTH_QUERY_TIMEOUT_SECONDS = 20.0
+HEALTH = Path(os.environ.get("RUNCAT_BATTERY_HEALTH_FILE", str(RUNCAT_HOME / "battery-health.json")))
+
+
+def cycle_count(text: str) -> int | None:
+    """Read the existing ioreg observation; zero cycles is valid."""
+    if raw_bool(text, "BatteryInstalled") is False:
+        return None
+    value = raw_number(text, "CycleCount")
+    return value if type(value) is int and 0 <= value <= 100_000 else None
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def _invalid_constant(value):
+    raise ValueError("Nonfinite JSON number")
+
+
+def strict_json(raw: bytes | str):
+    return json.loads(raw, object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
+
+
+def health_percent(raw: Any) -> int | None:
+    # Never interpret 0.92 as 92, or a full-charge mAh count as a percentage.
+    if isinstance(raw, str):
+        found = re.fullmatch(r"\s*([0-9]{1,3})\s*%\s*", raw)
+        return health_percent(int(found[1])) if found else None
+    if type(raw) in (int, float) and 1 <= raw <= 100 and int(raw) == raw:
+        return int(raw)
+    return None
+
+
+def parse_health_report(raw: bytes | str) -> dict:
+    """Select the unique health-info dictionary within SPPowerDataType only.
+
+    JSON keys are locale-independent. A narrow _items traversal supports the
+    report's grouped form; arbitrary nested dictionaries are not searched.
+    Raw reports and device identifiers are never returned or saved.
+    """
+    if len(raw) > MAX_PROFILER_BYTES:
+        raise RuntimeError("Battery health report is too large")
+    try:
+        report = strict_json(raw)
+    except (ValueError, UnicodeError, RecursionError):
+        raise RuntimeError("Battery health report is not valid JSON") from None
+    sections = report.get("SPPowerDataType") if isinstance(report, dict) else None
+    if not isinstance(sections, list):
+        raise RuntimeError("SPPowerDataType is missing from battery health report")
+    pending = [(item, 0) for item in sections]
+    matches = []
+    visited = 0
+    while pending:
+        item, depth = pending.pop()
+        visited += 1
+        if visited > 100 or depth > 4 or not isinstance(item, dict):
+            raise RuntimeError("Battery health report structure is unsupported")
+        if "sppower_battery_health_info" in item:
+            matches.append(item["sppower_battery_health_info"])
+        children = item.get("_items", [])
+        if not isinstance(children, list):
+            raise RuntimeError("Battery health report structure is unsupported")
+        pending.extend((child, depth + 1) for child in children)
+    if len(matches) != 1 or not isinstance(matches[0], dict):
+        raise RuntimeError("A unique battery health section was not available")
+    info = matches[0]
+    capacity = health_percent(info.get("sppower_battery_health_maximum_capacity"))
+    if capacity is None:
+        raise RuntimeError("macOS Maximum Capacity was unavailable; no raw-capacity estimate was used")
+    cycles = info.get("sppower_battery_cycle_count")
+    if isinstance(cycles, str) and re.fullmatch(r"[0-9]{1,6}", cycles):
+        cycles = int(cycles)
+    if type(cycles) is not int or not 0 <= cycles <= 100_000:
+        cycles = None
+    return {"maximumCapacityPercent": capacity, "cycleCount": cycles}
+
+
+def read_health_report() -> dict:
+    """One bounded, local system_profiler query; no shell or raw report on disk."""
+    import select
+    command = [SYSTEM_PROFILER, "SPPowerDataType", "-json", "-timeout", "15"]
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            env={**os.environ, "LC_ALL": "C", "LANG": "C"}, bufsize=0)
+    deadline = time.monotonic() + HEALTH_QUERY_TIMEOUT_SECONDS
+    chunks = bytearray()
+    try:
+        assert proc.stdout is not None
+        fd = proc.stdout.fileno()
+        os.set_blocking(fd, False)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise RuntimeError("Battery health query timed out")
+            try:
+                ready, _, _ = select.select([fd], [], [], left)
+                if not ready:
+                    raise RuntimeError("Battery health query timed out")
+                part = os.read(fd, min(65536, MAX_PROFILER_BYTES + 1 - len(chunks)))
+            except (InterruptedError, BlockingIOError):
+                continue
+            if not part:
+                break
+            chunks.extend(part)
+            if len(chunks) > MAX_PROFILER_BYTES:
+                raise RuntimeError("Battery health report is too large")
+        if proc.wait(timeout=max(0.05, deadline - time.monotonic())) != 0:
+            raise RuntimeError("Battery health query failed")
+        return parse_health_report(bytes(chunks))
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            proc.wait(timeout=2)
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+
+
+def load_health_cache(path: Path | None = None, now: float | None = None) -> dict | None:
+    """A small, typed cache; reject symlinks, special files and future dates."""
+    path = HEALTH if path is None else path
+    now = time.time() if now is None else now
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return None
+            raw = stream.read(MAX_HEALTH_BYTES + 1)
+        if len(raw) > MAX_HEALTH_BYTES:
+            return None
+        data = strict_json(raw)
+        if not isinstance(data, dict) or set(data) != {
+            "version", "source", "maximumCapacityPercent", "cycleCount", "observedAt", "lastAttemptAt", "lastAttemptSucceeded"
+        }:
+            return None
+        if type(data["version"]) is not int or data["version"] != 1 or data["source"] != "system_profiler.SPPowerDataType":
+            return None
+        attempt = data["lastAttemptAt"]
+        if not finite_number(attempt) or not 0 < attempt <= now or type(data["lastAttemptSucceeded"]) is not bool:
+            return None
+        cap, stamp, cycles = data["maximumCapacityPercent"], data["observedAt"], data["cycleCount"]
+        if cap is None:
+            if stamp is not None or cycles is not None or data["lastAttemptSucceeded"]:
+                return None
+        elif type(cap) is not int or health_percent(cap) is None or not finite_number(stamp) or not 0 < stamp <= attempt:
+            return None
+        if cycles is not None and (type(cycles) is not int or not 0 <= cycles <= 100_000):
+            return None
+        return data
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def health_record(observation: dict, now: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    capacity = health_percent(observation.get("maximumCapacityPercent"))
+    cycles = observation.get("cycleCount")
+    if cycles is not None and (type(cycles) is not int or not 0 <= cycles <= 100000):
+        raise RuntimeError("Invalid battery cycle count")
+    if capacity is None or not finite_number(now) or now <= 0:
+        raise RuntimeError("Invalid battery health observation")
+    return {"version": 1, "source": "system_profiler.SPPowerDataType",
+            "maximumCapacityPercent": capacity,
+            "cycleCount": cycles, "observedAt": now,
+            "lastAttemptAt": now, "lastAttemptSucceeded": True}
+
+
+def refresh_health(*, force: bool = False) -> bool:
+    # A separate, short-lived launchd job owns this slow path. The main sample
+    # never waits for this lock or starts a health child. RunAtLoad is cheap if
+    # installation or an immediately preceding login supplied a recent record.
+    validate_data_paths()
+    with sample_lock(HEALTH, timeout=0.0):
+        now = time.time()
+        old = load_health_cache(now=now)
+        if not force and old is not None and now - old["lastAttemptAt"] < HEALTH_STARTUP_COOLDOWN_SECONDS:
+            return True
+        try:
+            observation = read_health_report()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            failed = dict(old) if old is not None else {
+                "version": 1, "source": "system_profiler.SPPowerDataType",
+                "maximumCapacityPercent": None, "cycleCount": None, "observedAt": None,
+            }
+            failed.update(lastAttemptAt=time.time(), lastAttemptSucceeded=False)
+            atomic_write_json(HEALTH, failed)
+            return False
+        atomic_write_json(HEALTH, health_record(observation))
+        return True
+
+
+def health_display(text: str, *, now: float | None = None) -> tuple[str, dict]:
+    now = time.time() if now is None else now
+    missing = ("—", {"MaximumCapacitySource": "Unavailable", "HealthObservedAt": None,
+                      "HealthAgeSeconds": None, "HealthCached": False})
+    if raw_bool(text, "BatteryInstalled") is False:
+        return missing
+    record = load_health_cache(now=now)
+    if record is None or record["maximumCapacityPercent"] is None:
+        return missing
+    age = now - record["observedAt"]
+    current_cycles = cycle_count(text)
+    # A decrease is evidence that an old cache may refer to another battery.
+    # This is a conservative guard, not battery identity tracking.
+    old_cycles = record["cycleCount"]
+    if age > HEALTH_MAX_AGE_SECONDS or (current_cycles is not None and old_cycles is not None and current_cycles < old_cycles):
+        return missing
+    stale = not record["lastAttemptSucceeded"] or age > HEALTH_INTERVAL_SECONDS + 300
+    label = f'{record["maximumCapacityPercent"]}%' + (" (cached)" if stale else "")
+    return label, {"MaximumCapacitySource": record["source"], "HealthObservedAt": record["observedAt"],
+                   "HealthAgeSeconds": int(age), "HealthCached": stale}
+
+
 def build_snapshot(
 
     power_w: float | None,
@@ -726,6 +957,10 @@ def build_snapshot(
     runtime_coverage_seconds: float,
 
     runtime_sample_count: int,
+
+    maximum_capacity: str = "—",
+
+    cycles: int | None = None,
 
 ) -> dict[str, Any]:
 
@@ -815,6 +1050,8 @@ def build_snapshot(
                 "formattedValue": format_temp(temperature_c),
 
             },
+            {"title": "Maximum Capacity", "formattedValue": maximum_capacity},
+            {"title": "Cycle Count", "formattedValue": "—" if cycles is None else str(cycles)},
 
         ],
 
@@ -836,7 +1073,12 @@ def diagnostic(text: str) -> dict[str, Any]:
 
 
 
+    health_text, health_info = health_display(text)
+
     return {
+        "MaximumCapacity": health_text,
+        "CycleCount": cycle_count(text),
+        **health_info,
 
         "BatteryPowerRawUnsigned": raw_number(text, "BatteryPower"),
 
@@ -953,6 +1195,8 @@ def _sample_once_unlocked() -> str:
         runtime_coverage_seconds=coverage_seconds,
 
         runtime_sample_count=sample_count,
+        maximum_capacity=health_display(text, now=now)[0],
+        cycles=cycle_count(text),
 
     )
 
@@ -989,9 +1233,16 @@ def sample_lock(path: Path | None = None, timeout: float = 6.0):
         os.close(fd)  # Releases the advisory lock, including on exceptions.
 
 
+def validate_data_paths() -> None:
+    paths = (OUT, HISTORY, HEALTH)
+    locks = (HISTORY.with_name("." + HISTORY.name + ".lock"), HEALTH.with_name("." + HEALTH.name + ".lock"))
+    resolved = [p.expanduser().resolve() for p in (*paths, *locks)]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("Snapshot, history, health and lock paths must differ")
+
+
 def sample_once() -> str:
-    if OUT.expanduser().resolve() == HISTORY.expanduser().resolve():
-        raise ValueError("Snapshot and history paths must differ")
+    validate_data_paths()
     with sample_lock():
         return _sample_once_unlocked()
 
@@ -1020,7 +1271,21 @@ def main() -> None:
 
     )
 
+    parser.add_argument("--refresh-health", action="store_true", help="Refresh the six-hour macOS capacity cache (no power sample)")
+    parser.add_argument("--force-health", action="store_true", help="Force one capacity refresh; requires --refresh-health")
+    parser.add_argument("--health-probe", action="store_true", help="Read macOS capacity once without saving a cache")
     args = parser.parse_args()
+    if sum((args.diagnose, args.adaptive_sample, args.refresh_health, args.health_probe)) > 1:
+        parser.error("Sampling, health and diagnostic modes are mutually exclusive")
+    if args.force_health and not args.refresh_health:
+        parser.error("--force-health requires --refresh-health")
+    if args.health_probe:
+        print(json.dumps(read_health_report(), allow_nan=False))
+        return
+    if args.refresh_health:
+        if not refresh_health(force=args.force_health):
+            raise RuntimeError("macOS battery health could not be refreshed")
+        return
 
 
 

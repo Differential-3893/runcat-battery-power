@@ -11,8 +11,29 @@ It reads `AppleSmartBattery` telemetry with `ioreg` (plus `AppleSmartBatteryPack
 - **5m Peak** — peak power in the recent five-minute window
 - **Estimated Runtime** — estimated time remaining while discharging
 - **Temperature** — battery temperature
+- **Maximum Capacity** — macOS-reported maximum capacity (slow cached observation)
+- **Cycle Count** — the battery cycle counter from the existing ioreg sample
 
 While connected to external power, runtime is shown as `On AC`; while charging, it is shown as `Charging`.
+
+## Maximum capacity and cycles
+
+The two added text rows use **system-reported maximum capacity**, not
+`MaxCapacity=100` or a nominal/design-capacity ratio, and the existing
+`AppleSmartBattery.CycleCount`. The menu bar remains watts only; no additional
+progress bar is added. Example values (illustrative, not a live reading):
+
+```text
+Maximum Capacity: 92%
+Cycle Count: 156
+```
+
+A separate short-lived `dev.runcat.battery-health` LaunchAgent checks a
+`system_profiler SPPowerDataType -json` cache at login and every six hours.
+The fast sampler never launches or waits for that query. A failed/overdue
+observation is labeled `(cached)`; an absent or expired observation is `—`,
+not 100%. Read [the capacity/cycle contract](docs/BATTERY_HEALTH.md) for exact
+source keys, freshness, privacy, failure and verification limits.
 
 ## Temperature sources
 
@@ -104,20 +125,21 @@ sh install.sh
 
 The installer:
 
-1. tests a live sample in a temporary directory before replacing existing files,
+1. tests a live power sample and a native maximum-capacity query before replacing existing files,
 2. stops the old battery LaunchAgent and backs up its target files under
    `~/.runcat/backups/battery-power-.../`,
 3. atomically installs the producer and `dev.runcat.battery-power.plist`,
-4. starts the same adaptive sampler and verifies a live sample and running job,
-5. restores previous target files and launch state on detected installation failure.
+4. validates a native maximum-capacity observation and adds the independent six-hour job/cache,
+5. starts the same adaptive sampler and verifies a live sample and both job registrations,
+6. restores previous target files and both launch states on detected installation failure.
 
 Success ends with `LOCAL CHECK PASSED`. This checks actual telemetry, installed
 source, configuration and a running job; it does not automate observation of the
 RunCat UI or a full battery/AC polling cycle. No `sudo` is required.
 
 Existing source registration does not need to be re-added. Custom absolute paths
-(`RUNCAT_HOME`, `RUNCAT_OUT_FILE`, `RUNCAT_BATTERY_HISTORY_FILE`, and
-`RUNCAT_BATTERY_INSTALL_DIR`) are passed to both the initial sample and LaunchAgent.
+(`RUNCAT_HOME`, `RUNCAT_OUT_FILE`, `RUNCAT_BATTERY_HISTORY_FILE`,
+`RUNCAT_BATTERY_HEALTH_FILE`, and `RUNCAT_BATTERY_INSTALL_DIR`) are passed to both the initial sample and LaunchAgent.
 A later reinstall without these variables reuses paths from the existing plist.
 `PYTHON_BIN` can select a Python 3.10+ interpreter. A plain `sh install.sh`
 also preserves that recorded interpreter; the shell's bootstrap Python does not
@@ -131,7 +153,7 @@ From this repository, repeat the live verification with:
 python3 -B scripts/manage_install.py verify
 ```
 
-Then open **RunCat Neo → Settings → Metrics → Custom Metrics → Add Custom Metrics Source** and select:
+For an already registered source, keep it. Then open **RunCat Neo → Settings → Metrics → Custom Metrics → Add Custom Metrics Source** and select:
 
 ```text
 ~/.runcat/battery-power.json
@@ -151,6 +173,7 @@ From this repository, use the installed LaunchAgent's **saved Python and paths**
 python3 -B scripts/run_installed.py diagnose
 python3 -B scripts/run_installed.py refresh
 python3 -B scripts/run_installed.py show
+python3 -B scripts/run_installed.py refresh-health
 ```
 
 These commands also work with custom output/history/install directories without
@@ -173,6 +196,7 @@ Background logs, normally empty, are stored at:
 ```text
 ~/.runcat/battery-power.json
 ~/.runcat/battery-power-history.json
+~/.runcat/battery-health.json
 ```
 
 The JSON snapshot is written atomically so RunCat does not observe a partially
@@ -187,7 +211,7 @@ JSON writes reject NaN and Infinity.
 sh uninstall.sh
 ```
 
-To remove the LaunchAgent and installed scripts but keep the generated JSON/history files:
+To remove both LaunchAgents and installed scripts but keep the generated snapshot/history/health cache:
 
 ```bash
 sh uninstall.sh --keep-data
@@ -198,9 +222,21 @@ still registered there. Target files are backed up before removal. Backups,
 logs, the empty lock file, and unrelated files are retained; the installer never
 recursively removes a shared directory.
 
+## Roll back this health upgrade
+
+Use this version's complete printed backup directory; the rollback validates
+all target paths and hashes and first backs up the current state:
+
+```sh
+python3 -B scripts/manage_install.py rollback --backup '/absolute/printed/backup'
+```
+
+See [restoration details](docs/BATTERY_HEALTH.md). This does not rewrite remote
+GitHub commits, remove unrelated metrics, or promise recovery from power loss.
+
 ## Privacy
 
-The producer is local-only. It reads battery telemetry from `ioreg` and writes local JSON files. It makes no network requests.
+The producer is local-only. It reads battery telemetry from `ioreg`, reads macOS capacity via a bounded infrequent `system_profiler` call, and writes local JSON files. It makes no network requests.
 
 Raw battery/pack dumps are never written to the snapshot or history. Diagnostics
 print selected numeric/state fields and the temperature source, not device serials.

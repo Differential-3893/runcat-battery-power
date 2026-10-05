@@ -147,5 +147,16 @@ if __name__ == '__main__':
         self.run_helper('refresh',1)
         self.assertFalse(self.calls.exists())
 
+    def test_refresh_health_uses_saved_path_then_updates_card(self):
+        cache=self.home/'saved health cache.json'
+        self.payload['EnvironmentVariables']['RUNCAT_BATTERY_HEALTH_FILE']=str(cache)
+        self.save()
+        self.run_helper('refresh-health')
+        records=[json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual(len(records),2)
+        self.assertEqual(records[0]['argv'][-2:],['--refresh-health','--force-health'])
+        self.assertEqual(records[0]['env']['RUNCAT_BATTERY_HEALTH_FILE'],str(cache))
+        self.assertEqual(records[1]['env']['RUNCAT_BATTERY_HEALTH_FILE'],str(cache))
+
 
 if __name__ == '__main__': unittest.main()

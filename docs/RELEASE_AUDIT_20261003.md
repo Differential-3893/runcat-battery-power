@@ -1,5 +1,10 @@
 # Consolidated release audit — 2026-10-03
 
+Historical scope: the [capacity/cycle extension](BATTERY_HEALTH.md) supersedes
+this document's five-row/one-job description. Original test counts and source
+scope below refer to the earlier delivery.
+
+
 This delivery includes the previously unapplied runtime-preservation patch and
 the remaining documentation/CI corrections. It supersedes the separate
 `RunCat_runtime_preservation_20261003` delivery; do not layer that older package

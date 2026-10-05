@@ -1,5 +1,10 @@
 # Stabilization — 2026-10-03
 
+Historical scope: the [capacity/cycle extension](BATTERY_HEALTH.md) supersedes
+this document's five-row/one-job description. Original test counts and source
+scope below refer to the earlier delivery.
+
+
 Historical telemetry/installer patch notes. For the current consolidated delivery,
 see [release audit](RELEASE_AUDIT_20261003.md) and [runtime settings](RUNTIME_SETTINGS.md).
 

@@ -28,16 +28,18 @@ class RuntimeSettingsTests(unittest.TestCase):
         # between subprocesses. No real user launchctl or ioreg is accessed.
         runner = '''import json, os, sys\nfrom pathlib import Path\nfrom unittest.mock import patch
 sys.path.insert(0, TESTS)
-from test_install import manager, FakeLaunch, simulated_live_sample
+from test_install import manager, FakeLaunch, simulated_live_sample, simulated_live_health
 state = Path(os.environ['HOME']) / 'fake-launch.json'
 old = json.loads(state.read_text()) if state.exists() else {}
 launch = FakeLaunch(old.get('loaded',False), old.get('disabled',False))
+launch.health_loaded=old.get('health_loaded',False)
+launch.health_disabled=old.get('health_disabled',False)
 try:
-    with patch.object(manager, 'require_native'), patch.object(manager, 'launch', launch), patch.object(manager, 'live_sample', side_effect=simulated_live_sample):
+    with patch.object(manager, 'require_native'), patch.object(manager, 'launch', launch), patch.object(manager, 'live_sample', side_effect=simulated_live_sample), patch.object(manager, 'live_health', side_effect=simulated_live_health):
         manager.main()
         (state.parent / 'resolved-python.txt').write_text(manager.Config().python)
 finally:
-    state.write_text(json.dumps({'loaded': launch.is_loaded, 'disabled': launch.is_disabled}))
+    state.write_text(json.dumps({'loaded': launch.is_loaded, 'disabled': launch.is_disabled, 'health_loaded':launch.health_loaded, 'health_disabled':launch.health_disabled}))
 '''.replace('TESTS', repr(str(ROOT / 'tests')))
         (self.layout / 'scripts/manage_install.py').write_text(runner)
         self.bin = self.home / 'first bin'

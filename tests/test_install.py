@@ -22,30 +22,47 @@ class FakeLaunch:
         self.is_disabled = disabled
         self.fail_bootstraps = 0
         self.calls = []
+        self.health_loaded = False
+        self.health_disabled = False
+        self.fail_health_bootstraps = 0
+        self.fail_health_bootout = False
 
     def __call__(self, *args, check=True):
         self.calls.append(args)
+        health = any(manager.HEALTH_LABEL in arg for arg in args[1:])
+        loaded_attr = "health_loaded" if health else "is_loaded"
+        disabled_attr = "health_disabled" if health else "is_disabled"
         rc, output = 0, ""
         if args[0] == "print":
-            rc = 0 if self.is_loaded else 1
-            output = "state = running\npid = 12345\n" if self.is_loaded else ""
+            rc = 0 if getattr(self, loaded_attr) else 1
+            output = "state = running\npid = 12345\n" if rc == 0 else ""
         elif args[0] == "print-disabled":
-            output = f'"{manager.LABEL}" => {str(self.is_disabled).lower()}\n'
+            output = f'"{manager.LABEL}" => {str(self.is_disabled).lower()}\n"{manager.HEALTH_LABEL}" => {str(self.health_disabled).lower()}\n'
         elif args[0] == "bootout":
-            self.is_loaded = False
+            if health and self.fail_health_bootout:
+                rc = 1
+            else:
+                setattr(self, loaded_attr, False)
         elif args[0] == "bootstrap":
-            if self.fail_bootstraps:
+            if health and self.fail_health_bootstraps:
+                self.fail_health_bootstraps -= 1
+                rc = 1
+            elif self.fail_bootstraps:
                 self.fail_bootstraps -= 1
                 rc = 1
             else:
-                self.is_loaded = True
+                setattr(self, loaded_attr, True)
         elif args[0] == "enable":
-            self.is_disabled = False
+            setattr(self, disabled_attr, False)
         elif args[0] == "disable":
-            self.is_disabled = True
+            setattr(self, disabled_attr, True)
         if check and rc:
             raise RuntimeError("simulated launchctl failure")
         return subprocess.CompletedProcess([], rc, output, "")
+
+
+def simulated_live_health(cfg):
+    return manager.producer_module().health_record({"maximumCapacityPercent": 92, "cycleCount": 156})
 
 
 def simulated_live_sample(script, cfg, out=None, history=None):
@@ -57,9 +74,9 @@ def simulated_live_sample(script, cfg, out=None, history=None):
     history = cfg.history if history is None else history
     text = ('"BatteryInstalled" = Yes\n"ExternalConnected" = No\n"IsCharging" = No\n'
             '"Temperature" = 3049\n"Voltage" = 12000\n"InstantAmperage" = -1000\n'
-            '"AppleRawCurrentCapacity" = 4000\n')
+            '"AppleRawCurrentCapacity" = 4000\n"CycleCount" = 156\n')
     with patch.object(module, "OUT", out), patch.object(module, "HISTORY", history), \
-         patch.object(module, "run_ioreg", return_value=text):
+         patch.object(module, "HEALTH", cfg.health), patch.object(module, "run_ioreg", return_value=text):
         module.sample_once()
     return manager.snapshot_check(out, manager.time.time() - 1)
 
@@ -77,6 +94,7 @@ class InstallTests(unittest.TestCase):
         self.launch = FakeLaunch()
         self.stack.enter_context(patch.object(manager, "launch", self.launch))
         self.stack.enter_context(patch.object(manager, "live_sample", side_effect=simulated_live_sample))
+        self.stack.enter_context(patch.object(manager, "live_health", side_effect=simulated_live_health))
         self.stack.enter_context(contextlib.redirect_stdout(__import__("io").StringIO()))
         self.stack.enter_context(contextlib.redirect_stderr(__import__("io").StringIO()))
 
@@ -87,6 +105,9 @@ class InstallTests(unittest.TestCase):
             (cfg.install / name).write_text("old " + name)
             (cfg.install / name).chmod(0o700)
         cfg.plist.write_bytes(plistlib.dumps(cfg.payload()))
+        cfg.health_plist.write_bytes(plistlib.dumps(cfg.health_payload()))
+        cfg.health.parent.mkdir(parents=True, exist_ok=True)
+        cfg.health.write_text(json.dumps(simulated_live_health(cfg)))
         cfg.out.parent.mkdir(parents=True, exist_ok=True)
         cfg.history.parent.mkdir(parents=True, exist_ok=True)
         cfg.out.write_text('{"old":true}')
@@ -103,7 +124,7 @@ class InstallTests(unittest.TestCase):
             self.assertEqual((cfg.install / name).stat().st_mode & 0o777, 0o755)
         data = json.loads(cfg.out.read_text())
         self.assertEqual(data["metrics"][0]["formattedValue"], "12.0 W")
-        self.assertEqual(data["metrics"][-1]["formattedValue"], "30.5 °C")
+        self.assertEqual(data["metrics"][4]["formattedValue"], "30.5 °C")
 
     def test_custom_paths_persist_and_unrelated_metrics_untouched(self):
         custom = self.home / "custom & quoted ' directory"
@@ -256,7 +277,11 @@ class InstallTests(unittest.TestCase):
         fresh = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fresh)
         cfg = manager.Config()
-        with patch.object(fresh.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run, \
+        cfg.out.parent.mkdir(parents=True, exist_ok=True)
+        def fake_run(*a, **kw):
+            cfg.out.write_text("{}")
+            return subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(fresh.subprocess, "run", side_effect=fake_run) as run, \
              patch.object(fresh, "snapshot_check", return_value={}):
             fresh.live_sample(ROOT / "update-battery.py", cfg)
         env = run.call_args.kwargs["env"]

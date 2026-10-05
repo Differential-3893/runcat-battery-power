@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+*.lock
+battery-power.json
+battery-power-history.json
+battery-health.json
+.runcat/
+backups/

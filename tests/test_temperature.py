@@ -176,7 +176,7 @@ class TemperatureTests(unittest.TestCase):
                 self.assertEqual(stdout.getvalue(), "5\n" if state == "discharging" else "60\n")
                 self.assertEqual(stderr.getvalue(), "")
                 snapshot = json.loads(out.read_text())
-                self.assertEqual(snapshot["metrics"][-1]["formattedValue"],
+                self.assertEqual(snapshot["metrics"][4]["formattedValue"],
                                  battery.format_temp(case["expected_temperature_c"]))
                 expected_power = battery.battery_power_w(primary_text(primary))[0]
                 self.assertEqual(snapshot["metrics"][0]["formattedValue"], battery.format_watts(expected_power))
@@ -207,7 +207,7 @@ class TemperatureTests(unittest.TestCase):
                     self.assertEqual(stderr.getvalue(), "")
                     snapshot = json.loads(out.read_text())
                     self.assertEqual(snapshot["metrics"][0]["formattedValue"], "23.9 W")
-                    self.assertEqual(snapshot["metrics"][-1]["formattedValue"], "—")
+                    self.assertEqual(snapshot["metrics"][4]["formattedValue"], "—")
 
     def test_diagnose_uses_same_path_without_dumping_private_fields(self):
         case = FIXTURES[4]
